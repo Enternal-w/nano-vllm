@@ -11,7 +11,7 @@
 A lightweight vLLM implementation built from scratch.
 
 ## 重点关注
-A. 内存管理模块 (BlockManager 或类似命名)
+A. 内存管理模块 (BlockManager)
 这是灵魂所在。关注它是如何计算 GPU 还能容纳多少个 Block 的。
 
 重点关注：如何维护 free_blocks 列表，以及在 forward 之前如何根据输入长度分配 block_table。
