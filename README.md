@@ -31,6 +31,43 @@ D. 模型并行与定义 (nanovllm/layers/linear.py)
 
 重点关注：All-Reduce 操作发生在哪里。
 
+这是为您准备的 GitHub README 技术深度解析文档。它基于您对 `nanovllm` 源码的深入研究，采用 Infra 后端开发视角，系统地总结了推理引擎的核心机制。
+
+
+
+## 🚀 NanoVLLM 技术核心深度解析笔记
+
+本仓库是对高性能 LLM 推理引擎（如 vLLM）核心原理的轻量化实现与深度剖析。通过阅读源码，我针对显存管理、请求调度及分布式并行等方面总结了以下核心技术要点：
+
+### 1. 显存管理：基于 PagedAttention 的虚拟化解耦
+
+在传统推理框架中，KV Cache 的连续存储会导致严重的内部与外部显存碎片。`nanovllm` 通过 `BlockManager` 实现了物理显存与逻辑序列的彻底解耦：
+
+* **分页存储机制**：将显存划分为固定大小的物理块（Blocks），通过 `free_blocks` 队列进行动态管理。系统不再预留固定最大长度的连续空间，而是按需分配物理块，将显存利用率提升至接近 100%。
+* **逻辑映射与 BlockTable**：每个序列维护一个 `block_table`，记录了其逻辑顺序对应的物理块索引。这种映射允许算子（如 FlashAttention）在非连续的物理地址上执行高效的注意力计算。
+* **Prefix Caching（前缀缓存）**：利用 `compute_hash` 对 Token 序列进行哈希识别。在多轮对话中，如果不同请求共享相同的 System Prompt 或历史上下文，系统通过增加 `ref_count` 直接复用已存在的物理块，不仅节省了宝贵的显存，还消除了冗余的计算开销。
+
+### 2. 调度逻辑：Continuous Batching 与资源水位策略
+
+`Scheduler` 是整个推理引擎的控制大脑，其核心在于平衡系统吞吐量与推理延迟：
+
+* **动态 Batching 引擎**：不同于传统的静态 Batch，`Scheduler` 实时监控 GPU 资源水位（即 `BlockManager` 中的剩余可用块数）。只要资源满足 `can_allocate` 条件，新请求即可进入 Pre-fill 阶段。
+* **Prefill 与 Decode 优先级仲裁**：系统优先处理处于 Pre-fill 阶段的请求，以充分压榨 GPU 的计算密集型算力；随后进入 Decode 阶段进行逐字生成，此时任务转变为访存密集型。
+* **抢占机制 (Preemption)**：当显存水位达到极限，无法支撑现有请求继续生成下一个 Token 时，`Scheduler` 会执行抢占逻辑。它会牺牲最晚进入队列的请求，通过 `deallocate` 释放其占用的 Block 并将其状态重置为 `WAITING`，确保系统在高并发极端情况下不会因 OOM（显存溢出）而崩溃。
+
+### 3. 分布式并行：张量并行 (TP) 与通信掩盖
+
+为了支持单卡显存无法容纳的大模型，项目实现了基于 Megatron-LM 风格的张量并行策略：
+
+* **行列分片模式**：通过 `ColumnParallelLinear` 在输出维度切分权重，以及 `RowParallelLinear` 在输入维度切分权重。这种设计保证了在两次矩阵乘法之间无需跨卡通信。
+* **通信瓶颈优化**：识别出 `All-Reduce` 操作是 TP 并行的主要耗时点。在 `RowParallelLinear` 的 `forward` 结尾触发同步，将各卡的局部结果进行汇总。深入理解了跨卡带宽（如 NVLink）对并行加速比的关键影响。
+
+### 4. 高性能算子：Triton Kernel 与 Paged 存取
+
+* **高效写入 (Scatter-Store)**：利用 **Triton** 编写了自定义的 `store_kvcache_kernel`。该算子根据 `slot_mapping` 将计算出的新 K/V 向量以“散射”方式精准存入分散的物理槽位，有效规避了原生 PyTorch 索引赋值带来的高昂 Kernel Launch 开销。
+* **变长注意力适配**：集成 **FlashAttention-2** 的变长序列接口（Varlen），通过 `block_table` 引导算子在非连续内存布局上完成高效计算，确保了分页管理模式下的推理性能依旧接近硬件峰值。
+
+
 ## 学习总结
 
 * BlockManager实现了逻辑内存与物理显存的解耦，把显存切成Blocks，按需分配。它还引入了 Prefix Caching（前缀缓存）。如果两个请求的开头是一样的（比如相同的系统提示词），它们会共享同一物理块的引用，不仅省显存，还省去了重复计算。
